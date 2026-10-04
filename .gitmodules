@@ -1,16 +1,16 @@
 [submodule "FEX"]
 	path = FEX
-	url = https://github.com/willfaust/FEX.git
-	branch = ios-port-2607
+	url = https://github.com/spitefulowl/FEX.git
+	branch = staging
 [submodule "wine"]
 	path = wine
-	url = https://github.com/willfaust/wine.git
-	branch = madeira-lgpl
+	url = https://github.com/spitefulowl/wine.git
+	branch = staging
 [submodule "dxmt"]
 	path = dxmt
-	url = https://github.com/willfaust/dxmt.git
-	branch = ios-port
+	url = https://github.com/spitefulowl/dxmt.git
+	branch = staging
 [submodule "madeira-dock"]
 	path = madeira-dock
-	url = https://github.com/willfaust/madeira-dock.git
-	branch = main
+	url = https://github.com/spitefulowl/madeira-dock.git
+	branch = staging
