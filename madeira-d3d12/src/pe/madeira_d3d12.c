@@ -164,6 +164,7 @@ static char g_capture_ps[512]; static int g_capture_ps_loaded, g_capture_ps_shot
  * every material in compute, so this is how to see what a material samples. */
 static char g_capture_cs[64]; static int g_capture_cs_shots, g_capture_cs_max = 12, g_capture_cs_ind;
 static LONG g_barrier_renc_closed, g_stencil_srv, g_barrier_seen;
+static int g_attachless_split = -1; static LONG g_attachless_split_n;   /* ml1311 */
 struct mad_obj {
     void *vtbl;
     LONG refs;
@@ -485,8 +486,8 @@ static void mad_skip_report(void) {
     d3d12_log("[madeira-d3d12] ml1088 occlusion queries: %ld begun, %ld results delivered, %ld queries counted samples > 0, %ld pass restarts; "
               "ml1089 SRVs with a min-LOD clamp folded into the view: %ld (largest clamp %.1f)\n",
               g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts, g_srv_clamped, (double)g_srv_clamp_max);
-    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass); ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld\n",
-              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_zero_inst, g_stencil_srv);
+    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass); ml1311 attachment-less passes split %ld; ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld\n",
+              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_attachless_split_n, g_zero_inst, g_stencil_srv);
     mad_acct_report();
     d3d12_log("[madeira-d3d12] ml1050 residency set: %ld added, %ld removed (%ld members); tessellation: %ld pipelines (%ld built as mesh pipelines), "
               "%ld draws dropped, %ld drawn (%ld non-indexed); ml1147 DXBC geometry: %ld mesh pipelines, %ld draws; DXIL tessellation: %ld drawn\n",
@@ -3852,6 +3853,22 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         MAD_SKIP(e); return;
     }
     if (g_census_on) { exec_capture_draw(e, c); exec_desc_check(e, e->rs, e->root, e->pso->vs_name); }   /* ml910/ml913 */
+    /* ml1311: madeira.cfg attachless-split = 1 gives every draw of an
+     * attachment-less pass its own encoder. On Apple GPUs the fragment work of
+     * consecutive draws in one pass overlaps unless the shader uses raster
+     * order groups. Final Fantasy Tactics - The Ivalice Chronicles composites
+     * its UI layers with draws that read back and rewrite one UAV in such a
+     * pass, with no barrier between them (it works on PC GPUs in practice), and
+     * whole SIMD-group blocks of a layer vanished. A pass with no attachments
+     * has nothing to load or store; the fence chain orders the next one after
+     * it. Opt-in: Nanite-style passes run many UAV-atomic draws that need no
+     * order, and splitting them would serialise them. */
+    if (g_attachless_split < 0) { g_attachless_split = mad_cfg_int_pe("attachless-split", 0) ? 1 : 0;
+                                  if (g_attachless_split) d3d12_log("[madeira-d3d12] ml1311 attachless-split = 1 (one draw per attachment-less pass)\n"); }
+    if (g_attachless_split && e->renc && !e->enc_nrt && !e->enc_depth && !e->nrt && !e->depth && e->pass_draws) {
+        InterlockedIncrement(&g_attachless_split_n);
+        exec_end(e);
+    }
     if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
     g_dump_tables = 0;
     if (g_capture_on && g_capture_ps[0] && e->pso->ps_name[0] && strstr(g_capture_ps, e->pso->ps_name) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots */
