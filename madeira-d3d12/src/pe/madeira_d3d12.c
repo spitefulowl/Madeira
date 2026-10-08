@@ -243,7 +243,7 @@ struct mad_device {
      * old lookup walked the TEXTURE registries, which a buffer never enters, so
      * every typed-buffer binding failed and its draw or dispatch was skipped. */
     CRITICAL_SECTION view_lock;
-    struct mad_viewrec { UINT64 id; UINT32 a, b; } *vmap; unsigned vmap_cap, vmap_used, vmap_live;
+    struct mad_viewrec { UINT64 id; UINT32 a, b; UINT64 flat; } *vmap; unsigned vmap_cap, vmap_used, vmap_live;   /* ml1308: flat = the non-array sibling view (1 = none needed), 0 = not yet known */
     /* ml1061: GPU timeline. Every committed batch signals `gpu_event` with its
      * serial, so "has the GPU finished X" is a read of one value instead of a
      * blocking wait. Fences are delivered by a worker thread; argument-ring
@@ -385,7 +385,7 @@ static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT3
     i = mad_vmap_slot(id, d->vmap_cap);
     while (d->vmap[i].id && d->vmap[i].id != id) i = (i + 1) & (d->vmap_cap - 1);
     if (!d->vmap[i].id) { d->vmap_used++; d->vmap_live++; }
-    d->vmap[i].id = id; d->vmap[i].a = a; d->vmap[i].b = b;
+    d->vmap[i].id = id; d->vmap[i].a = a; d->vmap[i].b = b; d->vmap[i].flat = 0;
 }
 static void mad_vmap_del_locked(struct mad_device *d, UINT64 id) {
     unsigned i;
@@ -2864,6 +2864,68 @@ static struct mad_resource *mad_texture_of_view(struct mad_device *d, UINT64 id,
 /* The view's array length, which the backend packs above the min LOD clamp.
  * mad_texture_of_view already reverses a view id to its resource and view
  * index; the view records how many slices it spans. */
+/* ml1308: the NON-ARRAY view a DXBC shader must be given for a texture it declares
+ * as texture2d / texture2d_ms. Every 1D/2D texture is allocated as an array and
+ * every SRV/UAV view made as an array view (ml932), which is what Apple's converter
+ * wants (IRCompatibilityFlagForceTextureArray). The DXBC compiler declares the
+ * D3D type instead, and a texture2d sample through a 2D ARRAY view samples at the
+ * origin whatever the coordinate (the four corner texels with WRAP): Final Fantasy
+ * Tactics - The Ivalice Chronicles' video and UI passes drew one colour each on the
+ * iPad, and the same AIR on a Mac does exactly that once its planes are 2D arrays
+ * (toolchains/airconv-host/tools/render-video --array). Reads (ld) happened to work.
+ * The sibling is a 2D (2D multisample) view of the same levels and first slice,
+ * remembered in the view map entry, which dies with the resource's views. */
+static int g_flat_views = -1;   /* madeira.cfg sm5-flat-views (default 1) */
+#define MAD_SWZ_IDENTITY (2u | 3u << 8 | 4u << 16 | 5u << 24)
+static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, enum WMTTextureType want,
+                                  UINT lvl0, UINT nlvl, UINT sl0, UINT nsl, enum WMTPixelFormat pf, UINT swz);
+static UINT64 mad_air_flat_view(struct mad_device *d, UINT64 id) {
+    unsigned i; UINT64 flat = 0; int xv = -1;
+    struct mad_resource *r;
+    UINT type, lvl0, nlvl, sl0, pf, swz;
+    enum WMTTextureType want;
+    if (!id || id == MAD_VREC_TOMB) return id;
+    EnterCriticalSection(&d->view_lock);
+    if (d->vmap_cap) {
+        i = mad_vmap_slot(id, d->vmap_cap);
+        while (d->vmap[i].id) {
+            if (d->vmap[i].id == id) { flat = d->vmap[i].flat; break; }
+            i = (i + 1) & (d->vmap_cap - 1);
+        }
+    }
+    LeaveCriticalSection(&d->view_lock);
+    if (flat) return flat == 1 ? id : flat;
+    r = mad_texture_of_view(d, id, &xv);
+    if (!r || !r->texture) return id;
+    if (xv >= 0) {
+        type = r->xview[xv].type; lvl0 = r->xview[xv].lvl0; nlvl = r->xview[xv].nlvl;
+        sl0 = r->xview[xv].sl0; pf = r->xview[xv].pf; swz = r->xview[xv].swz;
+    } else {
+        type = (UINT)r->tex_type; lvl0 = 0; nlvl = r->tex_mips; sl0 = 0; pf = (UINT)r->tex_pf; swz = MAD_SWZ_IDENTITY;
+    }
+    if (type == (UINT)WMTTextureType2DArray && r->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) want = WMTTextureType2D;
+    else if (type == (UINT)WMTTextureType2DMultisampleArray) want = WMTTextureType2DMultisample;
+    else want = (enum WMTTextureType)~0u;
+    flat = 1;
+    if (want != (enum WMTTextureType)~0u) {
+        static unsigned said;
+        UINT64 v = mad_texture_view_id(d, r, want, lvl0, nlvl, sl0, 1, (enum WMTPixelFormat)pf, swz);
+        if (v && v != r->gpu_resource_id) flat = v;
+        if (said++ < 8)
+            d3d12_log("[madeira-d3d12] ml1308 DXBC texture2d binding: array view %#llx of %ux%u (%s) -> 2D view %#llx\n",
+                      (unsigned long long)id, r->width, r->height, r->name ? r->name : "?", (unsigned long long)(flat == 1 ? id : flat));
+    }
+    EnterCriticalSection(&d->view_lock);
+    if (d->vmap_cap) {
+        i = mad_vmap_slot(id, d->vmap_cap);
+        while (d->vmap[i].id) {
+            if (d->vmap[i].id == id) { d->vmap[i].flat = flat; break; }
+            i = (i + 1) & (d->vmap_cap - 1);
+        }
+    }
+    LeaveCriticalSection(&d->view_lock);
+    return flat == 1 ? id : flat;
+}
 static UINT mad_air_array_len(struct mad_device *d, UINT64 view_id) {
     int xv = -1;
     struct mad_resource *r;
@@ -3173,8 +3235,15 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                 tab[off + 0] = de.texture_view_id;
                 tab[off + 1] = ((UINT64)count << 32) | (UINT64)first;
             } else {
-                tab[off + 0] = de.texture_view_id;
-                tab[off + 1] = ((UINT64)mad_air_array_len(d, de.texture_view_id) << 32)
+                UINT64 vid = de.texture_view_id;
+                if (g_flat_views < 0) {
+                    g_flat_views = mad_cfg_int_pe("sm5-flat-views", 1) ? 1 : 0;
+                    d3d12_log("[madeira-d3d12] ml1308 DXBC texture2d bindings get %s (madeira.cfg sm5-flat-views)\n",
+                              g_flat_views ? "2D views of the array textures" : "the array views (old behaviour)");
+                }
+                if (g_flat_views && !(rg->flags & MADEIRA_IR_AIR_F_TEXTURE_ARRAY)) vid = mad_air_flat_view(d, vid);   /* ml1308 */
+                tab[off + 0] = vid;
+                tab[off + 1] = ((UINT64)mad_air_array_len(d, vid) << 32)
                              | (de.metadata & 0xffffffffull);     /* min LOD clamp */
             }
         } else {
