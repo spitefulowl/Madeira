@@ -4438,6 +4438,97 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
 }
 
 #define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
+/* ml1310: BC uploads on a GPU that cannot sample BC.
+ *
+ * winemetal creates every BC texture with an uncompressed format there
+ * (remap_unsupported_bc: BC1/2/3/7 -> RGBA8, BC4 -> R8, BC5 -> RG8, BC6H ->
+ * RGBA16F), and the iPad's A16 is such a GPU (supportsBCTextureCompression = NO).
+ * DXMT's D3D11 layer decodes the blocks before every upload; this runtime copied
+ * the raw blocks into the RGBA8 texture, so they were read as texels: noisy,
+ * repeated artwork (Final Fantasy Tactics - The Ivalice Chronicles' enhanced menu,
+ * 175 BC7 textures). Decoded here on the CPU at encode time -- the source is an
+ * UPLOAD buffer the application filled before ExecuteCommandLists -- into a
+ * staging buffer the command buffer keeps alive, and copied with the texel pitch.
+ * madeira.cfg d3d12-bc-decode = 0 restores the raw copy. */
+extern void mad_bcn_decode_image(const uint8_t *src, size_t src_pitch, uint8_t *dst, size_t dst_pitch,
+                                 uint32_t width, uint32_t height, int kind);
+extern uint32_t mad_bcn_texel_size(int kind);
+static int mad_bc_kind_of_pf(UINT pf) {
+    switch (pf) {
+    case WMTPixelFormatBC1_RGBA: case WMTPixelFormatBC1_RGBA_sRGB: return 1;
+    case WMTPixelFormatBC2_RGBA: case WMTPixelFormatBC2_RGBA_sRGB: return 2;
+    case WMTPixelFormatBC3_RGBA: case WMTPixelFormatBC3_RGBA_sRGB: return 3;
+    case WMTPixelFormatBC4_RUnorm: return 4;
+    case WMTPixelFormatBC4_RSnorm: return 14;
+    case WMTPixelFormatBC5_RGUnorm: return 5;
+    case WMTPixelFormatBC5_RGSnorm: return 15;
+    case WMTPixelFormatBC7_RGBAUnorm: case WMTPixelFormatBC7_RGBAUnorm_sRGB: return 7;
+    case WMTPixelFormatBC6H_RGBFloat: case WMTPixelFormatBC6H_RGBUfloat: return -1;   /* remapped, no decoder */
+    default: return 0;
+    }
+}
+static int g_bc_decode = -1;   /* 1: decode BC uploads (no native BC), 0: raw copies */
+static int mad_bc_decode_on(struct mad_device *d) {
+    if (g_bc_decode < 0) {
+        int want = mad_cfg_int_pe("d3d12-bc-decode", 1) ? 1 : 0, native = MTLDevice_supportsBCTextureCompression(d->mtl_device) ? 1 : 0;
+        g_bc_decode = want && !native;
+        d3d12_log("[madeira-d3d12] ml1310 BC sampling %s on this GPU; BC uploads are %s (madeira.cfg d3d12-bc-decode)\n",
+                  native ? "native" : "NOT available (winemetal stores BC textures uncompressed)",
+                  g_bc_decode ? "decoded on the CPU" : "copied raw");
+    }
+    return g_bc_decode;
+}
+static int mad_bc_upload_decoded(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_resource *t = c->u.bt.tex, *b = c->u.bt.buf;
+    struct wmtcmd_blit_copy_from_buffer_to_texture k;
+    struct WMTBufferInfo bi; obj_handle_t stage;
+    UINT mw, mh, md, cw, ch, cd, z;
+    size_t dst_pitch, slice_bytes;
+    int kind = mad_bc_kind_of_pf((UINT)t->tex_pf);
+    static LONG n_ok, n_nocpu, n_bc6;
+    if (!kind) return 0;
+    if (!mad_bc_decode_on(e->q->device)) return 0;
+    if (kind < 0) {
+        if (InterlockedIncrement(&n_bc6) <= 4) d3d12_log("[madeira-d3d12] ml1310 BC6H upload: no decoder, copied raw (texture %ux%u)\n", t->width, t->height);
+        return 0;
+    }
+    if (!b->cpu) {
+        if (InterlockedIncrement(&n_nocpu) <= 8)
+            d3d12_log("[madeira-d3d12] ml1310 BC upload from a GPU-only buffer (%llu bytes) into %ux%u: cannot decode on the CPU, copied raw\n",
+                      (unsigned long long)b->size, t->width, t->height);
+        return 0;
+    }
+    mad_mip_dims(t, c->u.bt.level, &mw, &mh, &md);
+    cw = c->u.bt.x < mw ? mw - c->u.bt.x : 0; if (c->u.bt.w < cw) cw = c->u.bt.w;
+    ch = c->u.bt.y < mh ? mh - c->u.bt.y : 0; if (c->u.bt.h < ch) ch = c->u.bt.h;
+    cd = c->u.bt.d ? c->u.bt.d : 1;
+    if (!cw || !ch) return 1;   /* nothing inside the level: D3D clips it away too */
+    if (c->u.bt.off + (UINT64)c->u.bt.row * c->u.bt.rows * cd > b->size) {
+        static LONG said; if (InterlockedIncrement(&said) <= 8) d3d12_log("[madeira-d3d12] ml1310 BC upload reads past its buffer; copied raw\n");
+        return 0;
+    }
+    dst_pitch = (size_t)cw * mad_bcn_texel_size(kind);
+    slice_bytes = dst_pitch * ch;
+    memset(&bi, 0, sizeof bi); bi.length = slice_bytes * cd; bi.options = WMTResourceStorageModeShared;
+    stage = MTLDevice_newBuffer(e->q->device->mtl_device, &bi);
+    if (!stage || !bi.memory.ptr) { if (stage) NSObject_release(stage); return 0; }
+    for (z = 0; z < cd; z++)
+        mad_bcn_decode_image((const uint8_t *)b->cpu + c->u.bt.off + (UINT64)z * c->u.bt.row * c->u.bt.rows, c->u.bt.row,
+                             (uint8_t *)bi.memory.ptr + (size_t)z * slice_bytes, dst_pitch, cw, ch, kind);
+    memset(&k, 0, sizeof k);
+    k.type = WMTBlitCommandCopyFromBufferToTexture;
+    k.src = stage; k.src_offset = 0;
+    k.bytes_per_row = dst_pitch; k.bytes_per_image = slice_bytes;
+    k.size.width = cw; k.size.height = ch; k.size.depth = cd;
+    k.dst = t->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
+    k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
+    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+    NSObject_release(stage);   /* the command buffer retains what it reads */
+    if (InterlockedIncrement(&n_ok) <= 4 || (n_ok % 1000) == 0)
+        d3d12_log("[madeira-d3d12] ml1310 BC%d upload decoded on the CPU: %ux%ux%u texels into %ux%u mip %u (%ld so far)\n",
+                  kind > 10 ? kind - 10 : kind, cw, ch, cd, t->width, t->height, (unsigned)c->u.bt.level, (long)n_ok);
+    return 1;
+}
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     switch (c->kind) {   /* ml1116: the destination is written */
@@ -4508,6 +4599,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     case MC_COPY_B2T: {
         struct wmtcmd_blit_copy_from_buffer_to_texture k;
         if (!c->u.bt.tex->texture || !c->u.bt.buf->buffer) { MAD_SKIP(e); return; }
+        if (mad_bc_upload_decoded(e, c)) return;   /* ml1310 */
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromBufferToTexture;
         k.src = c->u.bt.buf->buffer; k.src_offset = c->u.bt.off;
