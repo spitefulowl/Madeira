@@ -4054,19 +4054,7 @@ tess_go:
      * 256 useResource commands (MTLResourceListAddResource was ~2 % of all CPU
      * samples, 26,000 draws per 600 lists). Skip them exactly when they are
      * meaningless; small applications keep the old behaviour. */
-    const int ml1060_skip_lists = dev->resset && dev->nsrv > 256;
-    if (!ml1060_skip_lists) {
-        AcquireSRWLockShared(&dev->list_lock);   /* views are created on other threads */
-        for (i = 0; i < dev->nsrv && nur < 256; i++) {
-            struct mad_resource *r = dev->srv_res[i];
-            if (r) MAD_USE(r->texture ? r->texture : r->buffer);
-        }
-        for (i = 0; i < dev->nuav && nur < 256; i++) {
-            struct mad_resource *r = dev->uav_res[i];
-            if (r) MAD_USE_U(r->texture ? r->texture : r->buffer, WMTResourceUsageRead | WMTResourceUsageWrite);
-        }
-        ReleaseSRWLockShared(&dev->list_lock);
-    }
+    const int ml1060_skip_lists = dev->resset && dev->nsrv > 256;   /* ml1302: the lists themselves are declared right before the encode */
     if (dev->nsrv > 190 && !said_trunc++)
         d3d12_log("[madeira-d3d12] residency list truncated at 256 per draw (%u views); a real residency set is owed\n", dev->nsrv);
 #undef MAD_USE
@@ -4232,6 +4220,40 @@ tess_go:
         c_draw.base_instance = c->u.draw.istart;
         MAD_APPEND(&c_draw);
     }
+    /* ml1302: the device-wide view lists, read under list_lock and declared in
+     * front of everything else in this batch. The lock is now held until the
+     * batch is encoded: released earlier, a resource released on another thread
+     * in between (a loader freeing a texture this list never uses, legal in
+     * D3D12) had its Metal object freed while the batch still named it, and the
+     * driver's objc_retain in useResource read a dead object (Final Fantasy
+     * Tactics - The Ivalice Chronicles, loading screen, 2026-10-08). The command
+     * buffer retains what it is given, so a release after the encode is safe.
+     * Read here, after every early return above, so the lock is never left held. */
+    int ml1302_held = 0;
+    if (!ml1060_skip_lists) {
+        struct wmtcmd_base *dl_head = NULL, *dl_tail = NULL;
+#define MAD_USE_DL(h, u) do { if ((h) && nur < 256 && !mad_use_seen(e, e->renc, (h), (UINT32)(u), use_stages)) { \
+        memset(&ur[nur], 0, sizeof ur[nur]); ur[nur].type = WMTRenderCommandUseResource; ur[nur].resource = (h); \
+        ur[nur].usage = (enum WMTResourceUsage)(u); ur[nur].stages = (enum WMTRenderStages)use_stages; \
+        if (dl_tail) dl_tail->next.ptr = &ur[nur]; else dl_head = (struct wmtcmd_base *)&ur[nur]; \
+        dl_tail = (struct wmtcmd_base *)&ur[nur]; nur++; } } while (0)
+        AcquireSRWLockShared(&dev->list_lock);   /* views are created and released on other threads */
+        ml1302_held = 1;
+        for (i = 0; i < dev->nsrv && nur < 256; i++) {
+            struct mad_resource *r = dev->srv_res[i];
+            if (r) MAD_USE_DL(r->texture ? r->texture : r->buffer, WMTResourceUsageRead);
+        }
+        for (i = 0; i < dev->nuav && nur < 256; i++) {
+            struct mad_resource *r = dev->uav_res[i];
+            if (r) MAD_USE_DL(r->texture ? r->texture : r->buffer, WMTResourceUsageRead | WMTResourceUsageWrite);
+        }
+#undef MAD_USE_DL
+        if (dl_head) {   /* after the pipeline, before every draw command of this batch */
+            dl_tail->next.ptr = c_pso.next.ptr;
+            c_pso.next.ptr = dl_head;
+            if (tail == (struct wmtcmd_base *)&c_pso) tail = dl_tail;
+        }
+    }
     {   /* ml1088: count this draw into the current slot while a query is open.
          * Placed last so a skipped draw above never leaves the encoder's mode
          * out of step with vis_prev. The mode command goes FIRST in the chain
@@ -4252,6 +4274,7 @@ tess_go:
         }
         if (want != ~(UINT64)0) v->dirty = 1;
     }
+    if (ml1302_held) ReleaseSRWLockShared(&dev->list_lock);   /* ml1302: the batch is encoded */
     mad_use_commit(e);   /* this draw's useResource entries reached the encoder */
 #undef MAD_APPEND
     e->draws++; e->pass_draws++;   /* ml1098 */
@@ -4658,7 +4681,6 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     if (!ml1060_cskip) AcquireSRWLockShared(&dev->list_lock);
     for (i = 0; !ml1060_cskip && i < dev->nsrv && nur < 256; i++) { struct mad_resource *r = dev->srv_res[i]; if (r) MAD_CUSE(r->texture ? r->texture : r->buffer, WMTResourceUsageRead); }
     for (i = 0; !ml1060_cskip && i < dev->nuav && nur < 256; i++) { struct mad_resource *r = dev->uav_res[i]; if (r) MAD_CUSE(r->texture ? r->texture : r->buffer, (enum WMTResourceUsage)(WMTResourceUsageRead | WMTResourceUsageWrite)); }
-    if (!ml1060_cskip) ReleaseSRWLockShared(&dev->list_lock);
 #undef MAD_CUSE
     if (c->kind == MC_DISPATCH_INDIRECT) {
         memset(&c_dispi, 0, sizeof c_dispi);
@@ -4675,6 +4697,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     tail->next.ptr = NULL;
 #undef MAD_APPEND
     MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&c_pso);
+    if (!ml1060_cskip) ReleaseSRWLockShared(&dev->list_lock);   /* ml1302: held until the batch is encoded, see exec_draw */
     mad_use_commit(e);
     e->draws++;
     if (e->ncap_after_buf) {   /* ml922 */
