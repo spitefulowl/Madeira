@@ -17114,6 +17114,27 @@ static BOOL ios_subfloor_window_held( ULONG_PTR low, ULONG_PTR real )
     return FALSE;
 }
 
+#ifdef WINE_IOS
+/* ml1298 (see ios_oversize_reserve): an unhinted reserve of 64 GB or more gets a
+ * real 64 MB aligned part of oversize-reserve-mb. Opt-in, per game: madeira.cfg
+ * oversize-reserve = 1 (Game details > Large memory reservations). Off, such a
+ * reserve fails as before: a program that falls back to a smaller one when it
+ * fails would otherwise get a "successful" reserve whose top cannot be committed. */
+#define IOS_OVERSIZE_MIN   0x1000000000ULL   /* 64 GB */
+#define IOS_OVERSIZE_ALIGN 0x4000000UL       /* 64 MB */
+
+static long long ios_oversize_real_mb( void )
+{
+    static long long mb = -1;
+    if (mb < 0)
+        mb = madeira_cfg_bool( "oversize-reserve", 0 )   /* ml1298: serve a reserve too big for the map in part (Game details > Large memory reservations) */
+             ? madeira_cfg_int( "oversize-reserve-mb", 16384 )   /* ml1298: its real part (MB) */
+             : 0;
+    return mb;
+}
+
+#endif
+
 
 /***********************************************************************
  *           map_image_into_view
@@ -21521,6 +21542,96 @@ static int ios_lowalloc_process_qualifies(void)
     return hit;
 }
 
+#ifdef WINE_IOS
+/* ml1298: an unhinted reserve too big for the address map, served in part.
+ *
+ * Final Fantasy Tactics - The Ivalice Chronicles (FFT_classic.exe and
+ * FFT_enhanced.exe alike) starts with VirtualAlloc(NULL, 0x4003ffffff,
+ * MEM_RESERVE, PAGE_NOACCESS): 256 GB plus 64 MB of slack to align the base
+ * up to 64 MB. When that fails, main returns 0 and the game is gone before it
+ * opens a window (log of 2026-10-07). Its allocator then uses the first 64 GB
+ * as 1024 chunks of 64 MB: anything up to 512 MB takes the lowest free chunk,
+ * so the range fills from the bottom; a block above 512 MB is placed at the
+ * top of the 64 GB, which the game's 1 GB job-thread heaps need at once.
+ * iOS gives the app a 63 GB map, so such a reserve can never be real here.
+ *
+ * When every real placement has failed for an unhinted, reserve-only request
+ * of 64 GB or more, reserve a real 64 MB aligned range at its start
+ * (oversize-reserve-mb, 16 GB; halved down to 1 GB while the map has no hole
+ * that big) and report the size that was asked
+ * for. Nothing is mapped past the real part: a commit there fails as on any
+ * unreserved address (STATUS_NOT_MAPPED_VIEW) and is logged by
+ * ios_oversize_commit_failed. The 64 GB floor keeps Chromium's 16 and 32 GB
+ * PartitionAlloc pools on their own paths. */
+#define IOS_OVERSIZE_SLOTS 8
+static struct { uintptr_t base; SIZE_T real, size; } ios_oversize[IOS_OVERSIZE_SLOTS];
+static unsigned ios_oversize_n;
+static pthread_mutex_t ios_oversize_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static NTSTATUS ios_oversize_reserve( void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect )
+{
+    long long cap_mb = ios_oversize_real_mb();
+    SIZE_T want = *size_ptr, real, floor;
+
+    if (*ret || want < IOS_OVERSIZE_MIN || (type & ~MEM_TOP_DOWN) != MEM_RESERVE) return STATUS_NO_MEMORY;
+    if (cap_mb <= 0)
+    {
+        static int said;
+        if (!said++)
+            dprintf( 2, "[oversize] ml1298 unhinted reserve of %llu MB does not fit the map and fails; "
+                     "oversize-reserve = 1 (Game details > Large memory reservations) would serve it in part\n",
+                     (unsigned long long)(want >> 20) );
+        return STATUS_NO_MEMORY;
+    }
+    real = (SIZE_T)cap_mb << 20;
+    floor = min( real, (SIZE_T)1 << 30 );
+    for (; real >= floor; real >>= 1)
+    {
+        void *base = NULL;
+        SIZE_T sz = real, full = ROUND_SIZE( 0, want, page_mask );
+        unsigned slot;
+
+        if (allocate_virtual_memory( &base, &sz, type, protect, 0, 0, IOS_OVERSIZE_ALIGN, 0 )) continue;
+        pthread_mutex_lock( &ios_oversize_lock );
+        slot = ios_oversize_n++ % IOS_OVERSIZE_SLOTS;
+        ios_oversize[slot].base = (uintptr_t)base;
+        ios_oversize[slot].real = sz;
+        ios_oversize[slot].size = full;
+        pthread_mutex_unlock( &ios_oversize_lock );
+        dprintf( 2, "[oversize] ml1298 unhinted reserve of %llu MB: real %p+%llu MB, the other %llu MB "
+                 "is not mapped\n", (unsigned long long)(want >> 20), base, (unsigned long long)(sz >> 20),
+                 (unsigned long long)((full - sz) >> 20) );
+        *ret = base;
+        *size_ptr = full;
+        return STATUS_SUCCESS;
+    }
+    dprintf( 2, "[oversize] ml1298 unhinted reserve of %llu MB: no hole of %llu MB for its real part\n",
+             (unsigned long long)(want >> 20), (unsigned long long)(floor >> 20) );
+    return STATUS_NO_MEMORY;
+}
+
+/* ml1298: a failed commit past the real part of an oversized reserve. */
+static void ios_oversize_commit_failed( const void *addr, SIZE_T size, NTSTATUS status )
+{
+    static unsigned logged;
+    uintptr_t a = (uintptr_t)addr;
+    unsigned i;
+
+    if (!ios_oversize_n || logged >= 16) return;
+    for (i = 0; i < IOS_OVERSIZE_SLOTS; i++)
+    {
+        uintptr_t b = ios_oversize[i].base;
+        if (!b || a < b + ios_oversize[i].real || a >= b + ios_oversize[i].size) continue;
+        logged++;
+        dprintf( 2, "[oversize] ml1298 commit %p+0x%llx failed (0x%x): %llu MB into the reserve at 0x%llx, "
+                 "past its real %llu MB\n", addr, (unsigned long long)size, (unsigned)status,
+                 (unsigned long long)((a - b) >> 20), (unsigned long long)b,
+                 (unsigned long long)(ios_oversize[i].real >> 20) );
+        return;
+    }
+}
+#endif
+
 NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
                                          SIZE_T *size_ptr, ULONG type, ULONG protect )
 {
@@ -21939,6 +22050,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                         }
                     }
                 }
+                if (!ios_oversize_reserve( ret, size_ptr, type, protect )) return STATUS_SUCCESS;   /* ml1298 */
                 if (probed++ < 2)
                 {
                     ios_va_gap_probe( "jumbo reserve failed" );
@@ -22386,6 +22498,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
             }
         }
 
+        if (st && (type & MEM_COMMIT) && jumbo_hint) ios_oversize_commit_failed( jumbo_hint, jumbo_size, st );   /* ml1298 */
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
             ios_bigres_note( *ret, *size_ptr );
@@ -23603,6 +23716,11 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
 
         st = allocate_virtual_memory( ret, size_ptr, type, protect,
                                       limit_low, limit_high, align, attributes );
+        /* ml1298: the same oversized reserve through VirtualAlloc2, when nothing constrains it */
+        if (st && !jumbo_hint && !limit_low && !limit_high && !align && !attributes
+            && !ios_oversize_reserve( ret, size_ptr, type, protect ))
+            st = STATUS_SUCCESS;
+        if (st && (type & MEM_COMMIT) && jumbo_hint) ios_oversize_commit_failed( jumbo_hint, jumbo_size, st );
 
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
