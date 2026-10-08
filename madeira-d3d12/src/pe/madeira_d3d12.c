@@ -612,6 +612,8 @@ static void mad_view_list_del(struct mad_device *d, int uav, struct mad_resource
 }
 
 DEFINE_GUID(IID_IMTLDXGIDevice, 0x6bfa1657, 0x9cb1, 0x471a, 0xa4, 0xfb, 0x7c, 0xac, 0xf8, 0xa8, 0x12, 0x07);
+/* ml1300: not in the toolchain's d3d12.h (it ends at List7); value from Microsoft's DirectX-Headers d3d12.idl */
+DEFINE_GUID(IID_ID3D12GraphicsCommandList8, 0xee936ef9, 0x599d, 0x4d28, 0x93, 0x8e, 0x23, 0xc4, 0xad, 0x05, 0xce, 0x51);
 
 #define MAD_ROOT_PARAM_MAX 32
 #define MAD_ROOT_RANGE_MAX 32        /* ml1009: the OLD fixed cap; now only a log reference */
@@ -1157,7 +1159,7 @@ struct mad_cmd {
 #define MAD_ARG_VBTABLE_OFF    576u /* ml927: IRRuntimeVertexBuffers (31 x {addr, length, stride} = 496 bytes) at kIRVertexBufferBindPoint, object stage */
 
 struct mad_list {
-    ID3D12GraphicsCommandList7Vtbl *vtbl;   /* ml1144: full List7 slot table, List1..7 answered */
+    ID3D12GraphicsCommandList7Vtbl *vtbl;   /* ml1144: full List7 slot table, List1..7 answered; ml1300: List8's slot follows it (g_list_vtbl8) */
     LONG refs;
     const IID *iid;
     const char *name;
@@ -1205,12 +1207,13 @@ static HRESULT STDMETHODCALLTYPE list_QI(ID3D12GraphicsCommandList *This, REFIID
     /* ml1144: every D3D12 runtime answers GraphicsCommandList1..7 whatever the
      * hardware supports; the optional methods are gated by CheckFeatureSupport,
      * which reports them all off. UE 5.0 queries List4 for ray tracing whenever
-     * the device answers Device5, and a refusal is a LowLevelFatalError. */
+     * the device answers Device5, and a refusal is a LowLevelFatalError.
+     * ml1300: List8 too (its one method is gated by OPTIONS14, reported off). */
     if (out && (IsEqualGUID(riid, &IID_ID3D12CommandList) ||
                 IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList1) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList2) ||
                 IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList3) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList4) ||
                 IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList5) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList6) ||
-                IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList7))) {
+                IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList7) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList8))) {
         InterlockedIncrement(&o->refs);
         *out = o;
         return S_OK;
@@ -5532,7 +5535,16 @@ static void mad_list_wait_idle(struct mad_list *l) {
 static ID3D12Device10Vtbl g_device_vtbl;
 static ID3D12CommandQueueVtbl g_queue_vtbl;
 static ID3D12CommandAllocatorVtbl g_alloc_vtbl;
-static ID3D12GraphicsCommandList7Vtbl g_list_vtbl;
+/* ml1300: ID3D12GraphicsCommandList8 is List7 plus OMSetFrontAndBackStencilRef.
+ * The toolchain's d3d12.h stops at List7, so the List8 slot is appended after
+ * the List7 table; g_list_vtbl names that List7 part for every assignment below.
+ * Final Fantasy Tactics - The Ivalice Chronicles creates its command lists as
+ * List8 and treats E_NOINTERFACE as a lost device. */
+static struct {
+    ID3D12GraphicsCommandList7Vtbl v7;
+    void (STDMETHODCALLTYPE *OMSetFrontAndBackStencilRef)(ID3D12GraphicsCommandList *This, UINT front, UINT back);
+} g_list_vtbl8;
+#define g_list_vtbl (g_list_vtbl8.v7)
 static ID3D12FenceVtbl g_fence_vtbl;
 
 static HRESULT STDMETHODCALLTYPE device_QI(ID3D12Device *This, REFIID riid, void **out) {
@@ -10858,6 +10870,15 @@ static void STDMETHODCALLTYPE list_OMSetStencilRef(ID3D12GraphicsCommandList *Th
     struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_STENCIL_REF);
     if (c) c->u.stencil_ref = ref;
 }
+/* ml1300: List8. Allowed only with OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported,
+ * which is reported off, and winemetal carries one reference: the front value is used. */
+static void STDMETHODCALLTYPE list_OMSetFrontAndBackStencilRef(ID3D12GraphicsCommandList *This, UINT front, UINT back) {
+    static LONG warned;
+    if (front != back && !InterlockedExchange(&warned, 1))
+        d3d12_log("[madeira-d3d12] ml1300 OMSetFrontAndBackStencilRef(%u, %u): one reference here, the front one is used\n",
+                  front, back);
+    list_OMSetStencilRef(This, front);
+}
 static void mad_record_root(struct mad_list *l, UINT index, UINT64 value, int resolve) {
     struct mad_cmd *c;
     if (index >= MAD_ROOT_PARAM_MAX) {
@@ -11914,6 +11935,7 @@ static void build_vtables(void) {
     g_res_vtbl.GetDesc = (void *)res_GetDesc;
 
     madeira_fill_ID3D12GraphicsCommandList7(&g_list_vtbl);
+    g_list_vtbl8.OMSetFrontAndBackStencilRef = list_OMSetFrontAndBackStencilRef;   /* ml1300 */
     g_list_vtbl.GetDevice = (void *)list_GetDevice;
     g_list_vtbl.QueryInterface          = (void *)list_QI;
     g_list_vtbl.AddRef                  = (void *)list_AddRef;
