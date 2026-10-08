@@ -6731,6 +6731,110 @@ static void STDMETHODCALLTYPE device_CopyDescriptors(ID3D12Device *This,
     }
 }
 
+/* ---- pipeline library (ml1301) ---------------------------------------------
+ * An always-empty pipeline cache. Every Windows driver has pipeline libraries,
+ * so engines take CreatePipelineLibrary's success for granted: Final Fantasy
+ * Tactics - The Ivalice Chronicles kept the NULL it got from the E_NOTIMPL stub
+ * and dereferenced it in GetSerializedSize (2026-10-08). Here a Load* answers
+ * E_INVALIDARG ("no pipeline by that name"), on which an application creates the
+ * pipeline state itself and stores it; StorePipeline keeps nothing, so a library
+ * costs no memory. Serialize writes a 16-byte header of our own; a blob with that
+ * header is accepted as an empty library, any other blob gets
+ * D3D12_ERROR_DRIVER_VERSION_MISMATCH, after which applications start with an
+ * empty one. SHADER_CACHE still reports SINGLE_PSO only, so engines that check
+ * D3D12_SHADER_CACHE_SUPPORT_LIBRARY first behave as before. */
+static const BYTE g_plib_header[16] = { 'M','A','D','P','L','I','B','1', 1,0,0,0, 0,0,0,0 };
+struct mad_plib {
+    ID3D12PipelineLibrary1Vtbl *vtbl;
+    LONG refs;
+    const IID *iid;
+    const char *name;
+    struct mad_device *device;
+};
+static ID3D12PipelineLibrary1Vtbl g_plib_vtbl;
+
+static HRESULT STDMETHODCALLTYPE plib_QI(ID3D12PipelineLibrary1 *This, REFIID riid, void **out) {
+    struct mad_obj *o = (struct mad_obj *)This;
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(riid, &IID_ID3D12PipelineLibrary)) { InterlockedIncrement(&o->refs); *out = This; return S_OK; }
+    return mad_qi(o, riid, out, 1);
+}
+static ULONG STDMETHODCALLTYPE plib_AddRef(ID3D12PipelineLibrary1 *This) { return mad_addref((struct mad_obj *)This); }
+static ULONG STDMETHODCALLTYPE plib_Release(ID3D12PipelineLibrary1 *This) { return mad_release((struct mad_obj *)This); }
+static HRESULT STDMETHODCALLTYPE plib_GetPrivateData(ID3D12PipelineLibrary1 *This, REFGUID g, UINT *n, void *d) {
+    return mad_pd_get(This, g, n, d);
+}
+static HRESULT STDMETHODCALLTYPE plib_SetPrivateData(ID3D12PipelineLibrary1 *This, REFGUID g, UINT n, const void *d) {
+    return mad_pd_set(This, g, n, d);
+}
+static HRESULT STDMETHODCALLTYPE plib_SetPrivateDataInterface(ID3D12PipelineLibrary1 *This, REFGUID g, const IUnknown *d) {
+    return mad_pd_set_iface(This, g, d);
+}
+static HRESULT STDMETHODCALLTYPE plib_SetName(ID3D12PipelineLibrary1 *This, LPCWSTR name) { (void)This; (void)name; return S_OK; }
+static HRESULT STDMETHODCALLTYPE plib_GetDevice(ID3D12PipelineLibrary1 *This, REFIID riid, void **out) {
+    struct mad_plib *l = (struct mad_plib *)This;
+    return l->device->vtbl->QueryInterface((ID3D12Device10 *)l->device, riid, out);
+}
+static HRESULT STDMETHODCALLTYPE plib_StorePipeline(ID3D12PipelineLibrary1 *This, const WCHAR *name, ID3D12PipelineState *pso) {
+    (void)This;
+    return (name && pso) ? S_OK : E_INVALIDARG;
+}
+static HRESULT STDMETHODCALLTYPE plib_LoadGraphicsPipeline(ID3D12PipelineLibrary1 *This, const WCHAR *name,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
+    (void)This; (void)name; (void)desc; (void)riid;
+    if (out) *out = NULL;
+    return E_INVALIDARG;
+}
+static HRESULT STDMETHODCALLTYPE plib_LoadComputePipeline(ID3D12PipelineLibrary1 *This, const WCHAR *name,
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
+    (void)This; (void)name; (void)desc; (void)riid;
+    if (out) *out = NULL;
+    return E_INVALIDARG;
+}
+static HRESULT STDMETHODCALLTYPE plib_LoadPipeline(ID3D12PipelineLibrary1 *This, const WCHAR *name,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **out) {
+    (void)This; (void)name; (void)desc; (void)riid;
+    if (out) *out = NULL;
+    return E_INVALIDARG;
+}
+static SIZE_T STDMETHODCALLTYPE plib_GetSerializedSize(ID3D12PipelineLibrary1 *This) {
+    (void)This;
+    return sizeof g_plib_header;
+}
+static HRESULT STDMETHODCALLTYPE plib_Serialize(ID3D12PipelineLibrary1 *This, void *data, SIZE_T size) {
+    (void)This;
+    if (!data || size < sizeof g_plib_header) return E_INVALIDARG;
+    memcpy(data, g_plib_header, sizeof g_plib_header);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE device_CreatePipelineLibrary(ID3D12Device *This, const void *blob, SIZE_T size,
+        REFIID riid, void **out) {
+    struct mad_plib *l;
+    HRESULT hr;
+    if (size && !blob) return E_INVALIDARG;
+    if (size && (size < sizeof g_plib_header || memcmp(blob, g_plib_header, sizeof g_plib_header))) {
+        d3d12_log("[madeira-d3d12] ml1301 CreatePipelineLibrary: a %lu-byte blob from elsewhere, "
+                  "D3D12_ERROR_DRIVER_VERSION_MISMATCH\n", (unsigned long)size);
+        return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    }
+    if (!out) return S_FALSE;
+    *out = NULL;
+    l = calloc(1, sizeof *l);
+    if (!l) return E_OUTOFMEMORY;
+    l->vtbl = &g_plib_vtbl; l->refs = 1; l->iid = &IID_ID3D12PipelineLibrary1; l->name = "PipelineLibrary";
+    l->device = (struct mad_device *)This;
+    hr = plib_QI((ID3D12PipelineLibrary1 *)l, riid, out);
+    plib_Release((ID3D12PipelineLibrary1 *)l);
+    {
+        static LONG said;
+        if (!InterlockedExchange(&said, 1))
+            d3d12_log("[madeira-d3d12] ml1301 CreatePipelineLibrary: empty library (%lu-byte blob), hr=0x%08lx\n",
+                      (unsigned long)size, (unsigned long)hr);
+    }
+    return hr;
+}
+
 /* ---- query heap -----------------------------------------------------------
  * Queries are accepted and resolve to zero: no timing, no occlusion counts.
  * That is the honest minimum the engine's startup needs (it creates the heaps
@@ -11891,6 +11995,22 @@ static void build_vtables(void) {
     g_cmdsig_vtbl.SetPrivateDataInterface = cmdsig_SetPrivateDataInterface;
     g_cmdsig_vtbl.SetName                 = cmdsig_SetName;
     g_cmdsig_vtbl.GetDevice               = cmdsig_GetDevice;
+
+    g_plib_vtbl.QueryInterface          = plib_QI;   /* ml1301 */
+    g_plib_vtbl.AddRef                  = plib_AddRef;
+    g_plib_vtbl.Release                 = plib_Release;
+    g_plib_vtbl.GetPrivateData          = plib_GetPrivateData;
+    g_plib_vtbl.SetPrivateData          = plib_SetPrivateData;
+    g_plib_vtbl.SetPrivateDataInterface = plib_SetPrivateDataInterface;
+    g_plib_vtbl.SetName                 = plib_SetName;
+    g_plib_vtbl.GetDevice               = plib_GetDevice;
+    g_plib_vtbl.StorePipeline           = plib_StorePipeline;
+    g_plib_vtbl.LoadGraphicsPipeline    = plib_LoadGraphicsPipeline;
+    g_plib_vtbl.LoadComputePipeline     = plib_LoadComputePipeline;
+    g_plib_vtbl.GetSerializedSize       = plib_GetSerializedSize;
+    g_plib_vtbl.Serialize               = plib_Serialize;
+    g_plib_vtbl.LoadPipeline            = plib_LoadPipeline;
+    g_device_vtbl.CreatePipelineLibrary = (void *)device_CreatePipelineLibrary;
     g_device_vtbl.CreateCommittedResource = (void *)device_CreateCommittedResource;
     g_device_vtbl.CreateRootSignature = (void *)device_CreateRootSignature;
     g_device_vtbl.CreateDescriptorHeap = (void *)device_CreateDescriptorHeap;
