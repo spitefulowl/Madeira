@@ -17133,6 +17133,143 @@ static long long ios_oversize_real_mb( void )
     return mb;
 }
 
+/* ml1299: Final Fantasy Tactics - The Ivalice Chronicles' 64 GB arena, sized to
+ * the real part of ml1298.
+ *
+ * With ml1298 its 256 GB reserve succeeds with a real start, but the allocator
+ * that owns the first 64 GB of it places every block above 512 MB at the TOP of
+ * those 64 GB, and each thread of the game's job pool gets a 1 GB heap there
+ * (run of 2026-10-08: the commit at reserve+65519 MB failed, main returned 0).
+ * Neither the iPad's 63 GB map nor the 32 GB hole of an iPhone with a 512 GB map
+ * holds both ends of a 64 GB window. The allocator takes its size from one
+ * immediate in its init function (movabs rax, 0x1000000000 at FFT_classic.exe
+ * 0x140013cd9, FFT_enhanced.exe 0x140014851) and everything else from its own
+ * fields: chunk count, the owner check [base, base + size), the per-chunk table
+ * indexed (p - base) >> 26 and bounded by its 0x400 entries. Setting the
+ * immediate to the real part makes the whole arena, top included, real memory.
+ *
+ * Opt-in (madeira.cfg fft-arena-patch = 1), only for an image named
+ * FFT_classic.exe or FFT_enhanced.exe, only when the 96 bytes from the start of
+ * that function match exactly once (both call/branch offsets wildcarded), and
+ * only when a 256 GB + 64 MB reserve does not fit the map. The file on disk is
+ * untouched: image code pages are private copy-on-write, written here after the
+ * relocations and before the protections and the JIT-pool copy. */
+#define IOS_FFT_RESERVE   0x4004000000ULL   /* the game's 0x4003ffffff, page-rounded */
+#define IOS_FFT_ARENA_IMM 0x33              /* offset of the 8-byte immediate */
+static const short ios_fft_arena_pat[] =
+{
+    0x48,0x89,0x5c,0x24,0x08, 0x57, 0x48,0x83,0xec,0x30, 0x48,0x83,0x64,0x24,0x28,0x00,
+    0x48,0x8b,0xfa, 0x48,0x83,0x64,0x24,0x20,0x00, 0x33,0xd2, 0x45,0x33,0xc9, 0x45,0x33,0xc0,
+    0x48,0x8b,0xd9, 0xe8,-1,-1,-1,-1, 0x85,0xc0, 0x0f,0x88,-1,-1,-1,-1,
+    0x48,0xb8,0x00,0x00,0x00,0x00,0x10,0x00,0x00,0x00,        /* movabs rax, 0x1000000000 */
+    0x48,0xc7,0x83,0x18,0x02,0x00,0x00,0x00,0x04,0x00,0x00,   /* mov qword [rbx+0x218], 0x400 */
+    0x48,0x8b,0xd0, 0x48,0x89,0x83,0x10,0x02,0x00,0x00, 0x4c,0x8b,0xcf,
+    0x48,0x89,0xbb,0x08,0x02,0x00,0x00, 0x41,0xb8,0x00,0x00,0x00,0x04   /* mov r8d, 0x4000000 */
+};
+static SIZE_T ios_fft_arena_size;   /* the arena set by ml1299, 0 = not patched */
+
+static int ios_image_file_is( const UNICODE_STRING *nt_name, const char *want )
+{
+    size_t n = strlen( want ), len, i;
+    const WCHAR *name;
+
+    if (!nt_name || !nt_name->Buffer) return 0;
+    len = nt_name->Length / sizeof(WCHAR);
+    if (len < n) return 0;
+    name = nt_name->Buffer + len - n;
+    if (len > n && name[-1] != '\\' && name[-1] != '/') return 0;
+    for (i = 0; i < n; i++)
+    {
+        WCHAR c = name[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != (unsigned char)want[i]) return 0;
+    }
+    return 1;
+}
+
+static void ios_fft_arena_patch( char *base, const IMAGE_NT_HEADERS *nt, const IMAGE_SECTION_HEADER *sec,
+                                 SIZE_T total_size, const UNICODE_STRING *nt_name )
+{
+    const size_t n = ARRAY_SIZE( ios_fft_arena_pat );
+    const char *exe;
+    char *hit = NULL;
+    unsigned hits = 0;
+    long long mb;
+    SIZE_T arena;
+    UINT64 imm;
+    uintptr_t a, pg, pe;
+    void *probe;
+    int i;
+
+    if (ios_image_file_is( nt_name, "fft_classic.exe" )) exe = "FFT_classic.exe";
+    else if (ios_image_file_is( nt_name, "fft_enhanced.exe" )) exe = "FFT_enhanced.exe";
+    else return;
+    if (!madeira_cfg_bool( "fft-arena-patch", 0 ))   /* ml1299: Final Fantasy Tactics - The Ivalice Chronicles: shrink its 64 GB arena to the real part of oversize-reserve-mb */
+    {
+        dprintf( 2, "[fft-arena] ml1299 %s at %p: not patched (madeira.cfg fft-arena-patch = 1 turns it on)\n",
+                 exe, base );
+        return;
+    }
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
+    mb = ios_oversize_real_mb();
+    if (mb < 1024)
+    {
+        dprintf( 2, "[fft-arena] ml1299 %s: not patched, %s\n", exe,
+                 mb ? "oversize-reserve-mb is below 1024" : "it needs oversize-reserve = 1 (Game details > Large memory reservations)" );
+        return;
+    }
+    arena = ((SIZE_T)min( mb, 65536 ) << 20) & ~(SIZE_T)(IOS_OVERSIZE_ALIGN - 1);
+    probe = mmap( NULL, IOS_FFT_RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0 );
+    if (probe != MAP_FAILED)
+    {
+        munmap( probe, IOS_FFT_RESERVE );
+        dprintf( 2, "[fft-arena] ml1299 %s: not patched, its 256 GB reserve fits this address map\n", exe );
+        return;
+    }
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        SIZE_T size = sec[i].SizeOfRawData, off;
+
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) || sec[i].VirtualAddress >= total_size) continue;
+        if (sec[i].Misc.VirtualSize && sec[i].Misc.VirtualSize < size) size = sec[i].Misc.VirtualSize;
+        if (size > total_size - sec[i].VirtualAddress) size = total_size - sec[i].VirtualAddress;
+        for (off = 0; off + n <= size; off++)
+        {
+            const unsigned char *p = (const unsigned char *)base + sec[i].VirtualAddress + off;
+            size_t k;
+
+            if (p[0] != ios_fft_arena_pat[0]) continue;
+            for (k = 1; k < n; k++)
+                if (ios_fft_arena_pat[k] >= 0 && p[k] != ios_fft_arena_pat[k]) break;
+            if (k == n && !hits++) hit = (char *)p;
+        }
+    }
+    if (hits != 1)
+    {
+        dprintf( 2, "[fft-arena] ml1299 %s: not patched, the arena init matched %u times (a different build?)\n",
+                 exe, hits );
+        return;
+    }
+    for (i = 0; i < ios_jit_mapping_count; i++)
+        if (ios_jit_mappings[i].pe_base == base && !ios_jit_mappings[i].unmapped)
+        {
+            dprintf( 2, "[fft-arena] ml1299 %s: not patched, its pool copy already exists\n", exe );
+            return;
+        }
+    a = (uintptr_t)hit + IOS_FFT_ARENA_IMM;
+    pg = a & ~(uintptr_t)host_page_mask;
+    pe = (a + sizeof(imm) + host_page_mask) & ~(uintptr_t)host_page_mask;
+    if (mprotect( (void *)pg, pe - pg, PROT_READ | PROT_WRITE ))
+    {
+        dprintf( 2, "[fft-arena] ml1299 %s: not patched, the code page is not writable (errno %d)\n", exe, errno );
+        return;
+    }
+    imm = arena;
+    memcpy( hit + IOS_FFT_ARENA_IMM, &imm, sizeof(imm) );
+    ios_fft_arena_size = arena;
+    dprintf( 2, "[fft-arena] ml1299 %s: arena 65536 MB -> %llu MB (movabs at rva 0x%lx); ml1298 reserves it real\n",
+             exe, (unsigned long long)(arena >> 20), (unsigned long)(a - 2 - (uintptr_t)base) );
+}
 #endif
 
 
@@ -17518,6 +17655,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             (unsigned long long)image_info->base,
             (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) ? 1 : 0 );
     }
+    ios_fft_arena_patch( ptr, nt, sec, total_size, nt_name );   /* ml1299 */
 #endif
 
     /* set the image protections */
@@ -21552,13 +21690,14 @@ static int ios_lowalloc_process_qualifies(void)
  * opens a window (log of 2026-10-07). Its allocator then uses the first 64 GB
  * as 1024 chunks of 64 MB: anything up to 512 MB takes the lowest free chunk,
  * so the range fills from the bottom; a block above 512 MB is placed at the
- * top of the 64 GB, which the game's 1 GB job-thread heaps need at once.
- * iOS gives the app a 63 GB map, so such a reserve can never be real here.
+ * top of the 64 GB, which the game's 1 GB job-thread heaps need at once (see
+ * ml1299, ios_fft_arena_patch). iOS gives the app a 63 GB map, so such a
+ * reserve can never be real here.
  *
  * When every real placement has failed for an unhinted, reserve-only request
  * of 64 GB or more, reserve a real 64 MB aligned range at its start
  * (oversize-reserve-mb, 16 GB; halved down to 1 GB while the map has no hole
- * that big) and report the size that was asked
+ * that big, never below an ml1299 arena) and report the size that was asked
  * for. Nothing is mapped past the real part: a commit there fails as on any
  * unreserved address (STATUS_NOT_MAPPED_VIEW) and is logged by
  * ios_oversize_commit_failed. The 64 GB floor keeps Chromium's 16 and 32 GB
@@ -21585,6 +21724,7 @@ static NTSTATUS ios_oversize_reserve( void **ret, SIZE_T *size_ptr, ULONG type, 
     }
     real = (SIZE_T)cap_mb << 20;
     floor = min( real, (SIZE_T)1 << 30 );
+    if (ios_fft_arena_size > floor) floor = ios_fft_arena_size;   /* ml1299: the patched arena must be real */
     for (; real >= floor; real >>= 1)
     {
         void *base = NULL;
@@ -21605,8 +21745,9 @@ static NTSTATUS ios_oversize_reserve( void **ret, SIZE_T *size_ptr, ULONG type, 
         *size_ptr = full;
         return STATUS_SUCCESS;
     }
-    dprintf( 2, "[oversize] ml1298 unhinted reserve of %llu MB: no hole of %llu MB for its real part\n",
-             (unsigned long long)(want >> 20), (unsigned long long)(floor >> 20) );
+    dprintf( 2, "[oversize] ml1298 unhinted reserve of %llu MB: no hole of %llu MB for its real part%s\n",
+             (unsigned long long)(want >> 20), (unsigned long long)(floor >> 20),
+             ios_fft_arena_size ? " (the ml1299 arena)" : "" );
     return STATUS_NO_MEMORY;
 }
 
